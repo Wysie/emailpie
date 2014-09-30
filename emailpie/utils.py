@@ -1,9 +1,8 @@
 import re
-
 import gevent
+import smtplib
 
 from DNS.Base import ServerError
-
 from emailpie import settings
 
 # All we are really doing is comparing the input string to one
@@ -98,10 +97,13 @@ class EmailChecker(object):
     Errors are dictionaries with a message (str) and severity (int) key.
     """
 
-    def __init__(self, email, _gevent=settings.GEVENT_CHECKS):
+    def __init__(self, email, _gevent=settings.GEVENT_CHECKS, _check_mx = True, _check_smtp = False, _smtp_timeout = 10):
         self.email = email
         self.errors = []
         self.mx_records = None
+        self.smtp_timeout = _smtp_timeout
+        self.check_mx = _check_mx
+        self.check_smtp = _check_smtp | _check_mx
 
         self._gevent = _gevent
 
@@ -184,10 +186,14 @@ class EmailChecker(object):
                 message='Invalid email address.'
             )]
 
-    def check_valid_mx_records(self):
+    def _check_valid_mx_records(self):
         """
         Ensures that there are MX records for this domain.
         """
+
+        if not self.check_mx:
+            return []
+
         error = dict(
             severity=7,
             message='No MX records found for the domain.'
@@ -207,3 +213,65 @@ class EmailChecker(object):
 
     def check_nothing(self):
         return []
+
+    def check_smtp_if_email_exists(self):
+        """
+        Verify if the email address exists using smtplib.
+
+        Based on https://github.com/heropunch/validate-email-address and
+        https://www.webdigi.co.uk/blog/2009/how-to-check-if-an-email-address-exists-without-sending-an-email/
+        """
+
+        if not self.check_smtp:
+            return []
+
+        self._check_valid_mx_records()
+
+        errors = []
+
+        for mx_rec in self.mx_records:
+            mx_record = mx_rec[1]
+            try:                
+                smtp = smtplib.SMTP(timeout=self.smtp_timeout)
+                smtp.connect(mx_record)
+                status, _ = smtp.helo()
+
+                if status != 250:
+                    smtp.quit()
+                    errors += [dict(
+                        severity=6,
+                        message="SMTP Error: %s - %s - %s" % (mx_record, status,_)
+                    )]
+                    continue
+
+                smtp.mail('')
+                status, _ = smtp.rcpt(self.email)
+
+                if status == 250:
+                    smtp.quit()
+                    return [] #Success, return and ignore all previous errors
+                elif status == 550:
+                    errors += [dict(
+                        severity=6,
+                        message='SMTP Error: The email account that you tried to reach does not exist.'
+                    )]
+                    smtp.quit()
+                    return errors
+                else:
+                    errors += [dict(
+                        severity=6,
+                        message="SMTP Error: %s - %s - %s" % (mx_record, status,_)
+                    )]
+                    smtp.quit()
+            except smtplib.SMTPServerDisconnected:
+                errors += [dict(
+                    severity=6,
+                    message='SMTP Error: %s disconnected' % (mx_record)
+                )]
+            except smtplib.SMTPConnectError:
+                errors += [dict(
+                    severity=6,
+                    message='SMTP Error: Unable to connect to %s' % (mx_record)
+                )]
+
+        return errors
